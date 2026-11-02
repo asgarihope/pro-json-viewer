@@ -1,0 +1,14 @@
+{
+  "name": "pro-json-viewer",
+  "version": "1.6.0",
+  "private": true,
+  "type": "module",
+  "description": "Private JSON search, lossless formatting, and a visual graph for Chrome.",
+  "repository": "https://github.com/asgarihope/pro-json-viewer.git",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "test:browser": "node tests/browser/run.cjs"
+  },
+  "devDependencies": { "playwright": "1.64.1" }
+}

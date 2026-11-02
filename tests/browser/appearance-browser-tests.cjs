@@ -1,0 +1,133 @@
+const { browserPath, extensionRoot } = require('./helpers.cjs');
+const { chromium } = require('playwright');
+const path = require('node:path'), fs = require('node:fs/promises'), assert = require('node:assert/strict');
+(async () => {
+  const root = extensionRoot;
+  const context = await chromium.launchPersistentContext(path.resolve('.test-output/appearance-qa-profile'), {
+    executablePath: browserPath, headless: true,
+    viewport: { width: 1600, height: 1080 }, args: [`--disable-extensions-except=${root}`, `--load-extension=${root}`],
+  });
+  const checks = [], errors = [], requests = [];
+  context.on('page', p => { p.on('pageerror', e => errors.push(e.message)); p.on('request', r => { if (/^https?:/.test(r.url())) requests.push(r.url()); }); });
+  const check = (name, condition = true) => { assert.ok(condition, name); checks.push(name); console.log('PASS', name); };
+  const settle = async p => { await p.waitForFunction(() => document.getElementById('graph-viewport').dataset.animating !== 'true'); await p.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))); };
+  const ready = async p => p.waitForSelector('html[data-ready="true"]', { state: 'attached' });
+  const choose = async (p, theme) => {
+    if (await p.locator('#appearance-panel').isHidden()) await p.locator('#theme-toggle').click();
+    await p.locator(`[data-theme-value="${theme}"]`).click();
+    await p.waitForFunction(theme => document.documentElement.dataset.theme === theme, theme);
+    await p.locator('#appearance-close').click(); await settle(p);
+  };
+  try {
+    const setup = await context.newPage(); await setup.goto('chrome://extensions');
+    const id = await setup.evaluate(() => new Promise(resolve => chrome.developerPrivate.getExtensionsInfo({}, xs => resolve(xs.find(x => x.name.startsWith('JSON Viewer')).id))));
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const page = await context.newPage(); await page.goto(`chrome-extension://${id}/viewer.html`); await ready(page);
+    await choose(page, 'midnight');
+    if (await page.locator('#clear-document').isEnabled()) await page.locator('#clear-document').click();
+    await page.locator('#example').click(); await settle(page);
+    await page.locator('.graph-card-title').click(); await settle(page);
+    const viewport = await page.locator('#graph-viewport').boundingBox(), rootCard = page.getByRole('article', { name: 'root, object, $', exact: true });
+    const centered = async card => { const r = await card.boundingBox(), v = await page.locator('#graph-viewport').boundingBox(); return Math.abs(r.x + r.width / 2 - v.x - v.width / 2) < 1 && Math.abs(r.y + r.height / 2 - v.y - v.height / 2) < 1; };
+    check('Opened root is centered exactly in the visual viewport', await centered(rootCard));
+    const data = page.getByRole('article', { name: 'data, object, data', exact: true });
+    const before = await data.boundingBox();
+    const opening = await data.locator('.graph-collapse').evaluate(button => new Promise(resolve => {
+      button.click(); const samples = [], start = performance.now(), card = button.closest('.graph-card');
+      const sample = () => { const r = card.getBoundingClientRect(); samples.push({ x: r.x, y: r.y }); if (performance.now() - start < 180) requestAnimationFrame(sample); else resolve(samples); }; requestAnimationFrame(sample);
+    }));
+    check('Opening keeps its header anchored before the centering glide', opening.every(p => Math.abs(p.x - before.x) < 1 && Math.abs(p.y - before.y) < 1));
+    await settle(page);
+    check('A newly opened child is centered with the same zoom', await centered(data) && await page.locator('#graph-zoom-label').textContent() === '100%');
+    check('Collapse controls use a real SVG chevron with expanded state', await data.locator('.graph-collapse svg use').getAttribute('href') === '#i-chevron' && await data.locator('.graph-collapse').evaluate(el => el.classList.contains('is-open')));
+    await rootCard.locator('.graph-path-copy').click();
+    check('The root card has a copy button beside its path', await page.evaluate(() => navigator.clipboard.readText()) === '$');
+    await data.locator('.graph-path-copy').click();
+    check('Card-footer path copying uses the correct nested address', await page.evaluate(() => navigator.clipboard.readText()) === 'data');
+    await page.locator('#graph-show-all').click(); await settle(page);
+    const bio = page.locator('.graph-attribute').filter({ has: page.locator('.graph-key', { hasText: /^bio$/ }) });
+    await bio.locator('.graph-value').click(); await page.locator('#graph-tooltip').waitFor({ state: 'visible' });
+    const fullBio = 'Frontend developer building accessible tools for exploring complex JSON data, with a focus on clarity, speed, and privacy.';
+    await page.locator('#graph-copy-value').click();
+    check('Value panel copies the full value instead of the shortened preview', await page.evaluate(() => navigator.clipboard.readText()) === fullBio);
+    await page.locator('#graph-copy-path').click();
+    check('Copy button beside the path copies the exact attribute address', await page.evaluate(() => navigator.clipboard.readText()) === 'data.users[0].bio');
+    check('Copy controls keep the value panel open', await page.locator('#graph-tooltip').isVisible());
+    await page.locator('#graph-close-tooltip').click();
+    check('Value panel has a working close button', await page.locator('#graph-tooltip').isHidden());
+    const source = await page.locator('#editor').inputValue();
+    let previousCanvas = await page.locator('#graph-connections').evaluate(el => el.toDataURL());
+    for (const theme of ['light', 'ocean', 'forest', 'plum', 'sepia', 'midnight']) {
+      await choose(page, theme);
+      const canvas = await page.locator('#graph-connections').evaluate(el => el.toDataURL());
+      check(`${theme}: palette updates the complete app and redraws connectors`, await page.locator('html').getAttribute('data-theme') === theme && canvas !== previousCanvas);
+      previousCanvas = canvas;
+      check(`${theme}: primary text and card keys have readable contrast`, await page.evaluate(() => {
+        const luminance = rgb => { const a = rgb.match(/[\d.]+/g).slice(0, 3).map(Number).map(c => { c /= 255; return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }); return .2126 * a[0] + .7152 * a[1] + .0722 * a[2]; };
+        const contrast = (a, b) => (Math.max(luminance(a), luminance(b)) + .05) / (Math.min(luminance(a), luminance(b)) + .05);
+        const body = getComputedStyle(document.body), card = getComputedStyle(document.querySelector('.graph-card')), key = getComputedStyle(document.querySelector('.graph-key'));
+        return contrast(body.color, body.backgroundColor) > 7 && contrast(key.color, card.backgroundColor) > 4.5;
+      }));
+    }
+    check('Changing every theme leaves the JSON unchanged', await page.locator('#editor').inputValue() === source);
+    await page.locator('#tree-content [data-key-node]').filter({ hasText: '"email"' }).first().dblclick();
+    const selection = await page.evaluate(() => getSelection().toString());
+    await page.locator('[data-theme-value="light"]').evaluate(el => el.click()); await settle(page);
+    check('Theme changes preserve existing source text selection', selection === 'email' && await page.evaluate(() => getSelection().toString()) === selection);
+    await page.locator('#indent').selectOption('4'); await settle(page);
+    await choose(page, 'forest');
+    await page.waitForFunction(async () => (await chrome.storage.local.get('appearance')).appearance?.theme === 'forest');
+    await page.reload(); await ready(page); await settle(page);
+    check('Chosen theme persists after reloading the extension page', await page.locator('html').getAttribute('data-theme') === 'forest');
+    check('Saving appearance preserves the indentation preference and draft', await page.locator('#indent').inputValue() === '4' && (await page.locator('#editor').inputValue()).includes('Frontend developer'));
+    const popup = await context.newPage(); await popup.setViewportSize({ width: 460, height: 580 });
+    await popup.goto(`chrome-extension://${id}/popup.html`); await ready(popup);
+    check('Popup restores the same saved theme', await popup.locator('html').getAttribute('data-theme') === 'forest');
+    check('Appearance control fits inside the quick popup', await popup.locator('#theme-toggle').isVisible() && await popup.evaluate(() => document.documentElement.scrollWidth === 460));
+    await choose(popup, 'plum'); await page.waitForFunction(() => document.documentElement.dataset.theme === 'plum');
+    check('Theme selection synchronizes between open popup and viewer', await page.locator('html').getAttribute('data-theme') === 'plum');
+    await popup.close(); await page.bringToFront();
+    await choose(page, 'light'); await page.locator('#graph-show-all').click(); await settle(page);
+    await bio.locator('.graph-value').hover(); await page.locator('#graph-tooltip').waitFor({ state: 'visible' });
+    check('Light mode covers editor, toolbar, canvas, cards and value panel', await page.evaluate(() => {
+      const bright = value => { const rgb = value.match(/\d+/g).slice(0, 3).map(Number); return rgb.every(c => c > 200); };
+      return ['body', '.header', '.document', '#graph-viewport', '.graph-card', '#graph-tooltip'].every(s => bright(getComputedStyle(document.querySelector(s)).backgroundColor));
+    }));
+    await page.screenshot({ path: path.resolve('.test-output/json-viewer-light-preview.png') });
+    await page.locator('#graph-close-tooltip').click();
+    await page.locator('#raw-tab').click();
+    const longValue = 'First line\nSecond line 🧩 ' + 'complete value '.repeat(25);
+    await page.locator('#editor').fill(JSON.stringify({ empty: [], profile: { bio: longValue, small: 'hi' } }));
+    await page.locator('#beautify').click(); await settle(page); await page.locator('#graph-show-all').click(); await settle(page);
+    const empty = page.getByRole('article', { name: 'empty, array, empty', exact: true });
+    await empty.locator('.graph-card-title').click(); await settle(page);
+    check('Clicking an empty array shows an explicit empty message', (await page.locator('#toast').textContent()).includes('empty array') && await page.locator('.graph-card').count() === 3);
+    await page.locator('#tree-content [data-key-node]').filter({ hasText: '"empty"' }).click();
+    check('Empty arrays also give feedback in the source tree', (await page.locator('#toast').textContent()).includes('empty array'));
+    const small = page.locator('.graph-attribute').filter({ has: page.locator('.graph-key', { hasText: /^small$/ }) });
+    await small.locator('.graph-value').click(); await page.locator('#graph-tooltip').waitFor({ state: 'visible' });
+    await page.locator('#graph-copy-value').click();
+    check('Even a short value can open a pinned panel and copy its exact text', await page.evaluate(() => navigator.clipboard.readText()) === 'hi');
+    await page.locator('#graph-close-tooltip').click();
+    const long = page.locator('.graph-attribute').filter({ has: page.locator('.graph-key', { hasText: /^bio$/ }) });
+    await long.locator('.graph-value').click(); await page.locator('#graph-tooltip').waitFor({ state: 'visible' });
+    await page.locator('#graph-copy-value').click();
+    const copiedLongValue = await page.evaluate(() => navigator.clipboard.readText());
+    check('Copying a string preserves decoded line breaks and Unicode using native clipboard line endings', copiedLongValue.replace(/\r\n/g, '\n') === longValue);
+    await page.evaluate(() => { window.originalWrite = navigator.clipboard.writeText.bind(navigator.clipboard); navigator.clipboard.writeText = () => Promise.reject(new DOMException('Blocked for test', 'NotAllowedError')); });
+    await page.locator('#graph-copy-path').click();
+    check('Blocked clipboard access selects the exact path for native copying', await page.evaluate(() => getSelection().toString()) === 'profile.bio');
+    await page.keyboard.press('Control+c');
+    check('Native copying still works for the value-panel path', await page.evaluate(() => navigator.clipboard.readText()) === 'profile.bio');
+    await page.evaluate(() => { navigator.clipboard.writeText = window.originalWrite; delete window.originalWrite; });
+    await page.locator('#graph-close-tooltip').click();
+    await page.locator('#theme-toggle').click();
+    await page.locator('[data-theme-value="light"]').focus(); await page.keyboard.press('ArrowRight');
+    check('Theme presets support keyboard navigation', await page.locator('html').getAttribute('data-theme') === 'ocean');
+    await page.keyboard.press('Escape');
+    check('Escape dismisses appearance and restores focus', await page.locator('#appearance-panel').isHidden() && await page.locator('#theme-toggle').evaluate(el => el === document.activeElement));
+    check('No outbound requests or JavaScript errors', requests.length === 0 && errors.length === 0);
+    await fs.writeFile(path.resolve('.test-output/appearance-test-report.json'), JSON.stringify({ checks, errors, requests }, null, 2));
+    console.log(`${checks.length} appearance/value-panel browser checks passed.`);
+  } finally { await context.close(); }
+})().catch(error => { console.error(error); process.exitCode = 1; });
